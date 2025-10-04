@@ -4,6 +4,10 @@ import argparse, os, sys
 from pathlib import Path
 from datetime import datetime, timedelta
 import numpy as np, pandas as pd, pytz
+# New engine + report bits
+from soccermodel.dc_engine_v2 import DixonColesV2Adapter, DCConfig
+from soccerprediction.reporting.fixture_report import build_fixture_report, ReportConfig
+
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'src'))
 
