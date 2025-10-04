@@ -67,7 +67,7 @@ def recency_weighted_last5(df: pd.DataFrame, team: str, cols):
     g = g.sort_values("date").tail(5)
     if g.empty:
         return {c: np.nan for c in cols}, 0
-    w = REC_WEIGHTS[-len(g):]
+    w = REC_WEIGHTS[:len(g)]
     w = w / w.sum()
     out = {}
     for c in cols:
