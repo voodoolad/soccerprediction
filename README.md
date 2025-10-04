@@ -1,0 +1,54 @@
+# Soccer Market Model — End‑to‑End Starter (v6.2)
+
+**What’s new vs v6.1**
+- **Diagnostics & Data Used** section with **tables** (last‑5 recency‑weighted) for each team.
+- **League‑mean shrinkage** for corners/cards rates → avoids silly tails (e.g., 5.5% for >9.5).
+- **Player props (top candidates)**: simple Poisson using recent shots/SOT; prints top 2 per team.
+- **Source status report** (which sites loaded; what was used/fallback).
+- **VS Code** settings file included (`.vscode/settings.json`) to fix Pylance “import cannot be resolved”.
+
+## Install
+```bat
+py -3.12 -m venv .venv312
+.\.venv312\Scripts\activate
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+pip install -e .
+```
+
+## Sanity checks
+```bat
+python scripts\check_soccerdata.py
+python scripts\smoke_all_sources.py
+```
+
+## Run
+```bat
+python scripts\run_predict_plus.py ^
+  --league "ENG-Premier League" ^
+  --season 2024 ^
+  --fixtures "Chelsea vs Liverpool|2025-10-05 03:30:00" ^
+  --timezone "Australia/Sydney" ^
+  --out out\chelsea_liverpool.md ^
+  --stdout ^
+  --with_tables ^
+  --odds_json docs\example_odds.json
+```
+
+- `--stdout` prints and saves.
+- `--with_tables` appends tables of the **exact statistics** used (source + last‑5 recency means).
+- `--odds_json` enables EV% and 0.33×Kelly.
+
+## Canonical names
+```bat
+python -c "import soccerdata as sd; print(sd.FBref.available_leagues()[:40])"
+python -c "import soccerdata as sd; fb=sd.FBref(leagues=['ENG-Premier League'],seasons=[2024]); sch=fb.read_schedule(); print('\n'.join(sorted(set(sch['home_team']).union(sch['away_team']))))"
+```
+
+## One source per stat
+FBref (schedule/goals, corners, cards) • Understat (xG/events) • SofaScore (injuries) • ESPN (lineups/roles) • FotMob (duels features; falls back to FBref proxies if absent) • ClubElo (SoS).
+
+## Output
+- Picks + EV/Min‑Acceptable
+- **Diagnostics & Data Used** (metrics tables + λ values)
+- Player props (top 2 per team: **Shots** and **Shots on Target**)

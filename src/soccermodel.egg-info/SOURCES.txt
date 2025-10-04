@@ -1,0 +1,14 @@
+README.md
+pyproject.toml
+setup.cfg
+src/soccermodel/__init__.py
+src/soccermodel/data_sources.py
+src/soccermodel/market_pricing.py
+src/soccermodel/odds_adapter.py
+src/soccermodel/report.py
+src/soccermodel.egg-info/PKG-INFO
+src/soccermodel.egg-info/SOURCES.txt
+src/soccermodel.egg-info/dependency_links.txt
+src/soccermodel.egg-info/top_level.txt
+src/soccermodel/models/corners_cards.py
+src/soccermodel/models/goals_dc.py

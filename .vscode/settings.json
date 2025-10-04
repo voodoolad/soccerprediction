@@ -1,0 +1,8 @@
+{
+  "python.defaultInterpreterPath": ".venv312/Scripts/python.exe",
+  "python.analysis.extraPaths": [
+    "./src"
+  ],
+  "python.analysis.diagnosticMode": "workspace",
+  "python.terminal.activateEnvironment": true
+}
