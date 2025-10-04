@@ -76,9 +76,9 @@ def recency_weighted_last5(df: pd.DataFrame, team: str, cols):
     return out, len(g)
 
 def make_corners_training(hub: DataHub):
-    misc = _norm(hub.fbref.read_team_match_stats(stat_type="misc", opponent_stats=False))
-    ptyp = _norm(hub.fbref.read_team_match_stats(stat_type="passing_types", opponent_stats=False))
-    poss = _norm(hub.fbref.read_team_match_stats(stat_type="possession", opponent_stats=False))
+    misc = _norm(hub.fbref.read_team_match_stats(stat_type="misc", opponent_stats=True))
+    ptyp = _norm(hub.fbref.read_team_match_stats(stat_type="passing_types", opponent_stats=True))
+    poss = _norm(hub.fbref.read_team_match_stats(stat_type="possession", opponent_stats=True))
     df = (misc.merge(ptyp, on=["league","season","team","date"], how="left", suffixes=("","_pt"))
               .merge(poss, on=["league","season","team","date"], how="left", suffixes=("","_pos")))
     cols = list(df.columns)
@@ -93,7 +93,7 @@ def make_corners_training(hub: DataHub):
     return df
 
 def make_cards_training(hub: DataHub):
-    misc = _norm(hub.fbref.read_team_match_stats(stat_type="misc", opponent_stats=False))
+    misc = _norm(hub.fbref.read_team_match_stats(stat_type="misc", opponent_stats=True))
     disc_raw = hub.fotmob.read_team_match_stats(stat_type="Discipline", opponent_stats=True)
     disc = _norm(disc_raw)
     if "team" not in disc.columns:
