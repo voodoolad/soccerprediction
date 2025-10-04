@@ -1,582 +1,369 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Run a one-off fixture report (scrape -> model -> extended markdown).
+
+What you get per fixture:
+- Goals (Dixon–Coles v2): 1X2, BTTS, Over/Under 1.5/2.5/3.5
+- Corners totals: Over 7.5/8.5/9.5 (if Football-Data has HC/AC)
+- Cards totals: Over 3.5/4.5 (if Football-Data has HY/HR/AY/AR)
+- Trend percentages (last N): goals/corners/cards + per-team corners
+
+No CSV needed. You keep your old flags:
+  --league "ENG-Premier League" --season 2025
+  --fixtures "Chelsea vs Liverpool|2025-10-05 03:30:00"
+  --timezone "Australia/Sydney" --out out\\chelsea_liverpool.md
+
+Notes:
+- PPDA is intentionally hidden until a reliable source is wired to avoid 'nan'.
+- If Football-Data corners/cards are missing for that league/season, those sections are omitted.
+
+This file replaces the previous run_predict_plus.py that printed the "Picks by Tier"
+layout and mixed old engine imports. (See your current output markdown for reference.)
+"""
+
 from __future__ import annotations
-import argparse, os, sys
+
+import argparse
+import os
+import sys
 from pathlib import Path
-from datetime import datetime, timedelta
-import numpy as np, pandas as pd, pytz
-# New engine + report bits
-from soccermodel.dc_engine_v2 import DixonColesV2Adapter, DCConfig
-from soccerprediction.reporting.fixture_report import build_fixture_report, ReportConfig
+import difflib
+import numpy as np
+import pandas as pd
 
+# Ensure local 'src' is importable
+sys.path.append(os.path.join(os.path.dirname(__file__), "..", "src"))
 
-sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'src'))
-
+# Your existing hub (kept)
 from soccermodel.data_sources import DataHub, SourceConfig
-from soccermodel.models.goals_dc import fit_dixon_coles, scoreline_pmf, DCConfig
-from soccermodel.models.corners_cards import fit_poisson_glm, predict_rate, PoissonSpec
-from soccermodel.market_pricing import fair_odds, american_from_decimal, min_acceptable_odds, ev_percent
-from soccermodel.odds_adapter import load_odds_from_json, kelly_fraction, remove_vig_proportional, american_from_decimal as am_from_dec
-from soccermodel.report import render_game_report
-from soccermodel.advanced_features import AdvancedFeatureEngine
-from soccermodel.opponent_adjuster import OpponentAdjuster
 
-REC_WEIGHTS = np.array([0.30, 0.25, 0.20, 0.15, 0.10])
+# New report/engine (kept minimal; the report builds/fits DC v2 internally)
+from soccerprediction.reporting.fixture_report import build_fixture_report, ReportConfig
+from soccerprediction.utils.names import normalize_name
+
+# -------------------------
+# CLI parsing and helpers
+# -------------------------
 
 def parse_fixture(s: str):
-    teams, ts = s.split("|", 1)
+    """
+    Expected format per your old CLI: "Home Team vs Away Team|YYYY-MM-DD HH:MM:SS"
+    The date/time is optional for probabilities; it's used only to disambiguate fixtures.
+    """
+    if "|" in s:
+        teams, ts = s.split("|", 1)
+        kickoff = ts.strip()
+    else:
+        teams, kickoff = s, ""
+    if " vs " not in teams:
+        raise ValueError(f"Fixture must look like 'A vs B|...': got {s}")
     home, away = teams.split(" vs ", 1)
-    return {"home": home.strip(), "away": away.strip(), "kickoff": ts.strip()}
-
-def _ensure_keys(df: pd.DataFrame) -> pd.DataFrame:
-    if not set(["league","season","team","date"]).issubset(df.columns):
-        df = df.reset_index()
-    return df
+    return {"home": home.strip(), "away": away.strip(), "kickoff": kickoff}
 
 def _flatten_cols(df: pd.DataFrame) -> pd.DataFrame:
     if isinstance(df.columns, pd.MultiIndex):
-        df.columns = [" ".join([str(x) for x in tup if x and x!='Unnamed: 0']).strip() for tup in df.columns.to_list()]
+        df.columns = [
+            " ".join([str(x) for x in tup if x and x != "Unnamed: 0"]).strip()
+            for tup in df.columns.to_list()
+        ]
     else:
         df.columns = [str(c) for c in df.columns]
     return df
 
 def _norm(df: pd.DataFrame) -> pd.DataFrame:
-    df = _ensure_keys(df); df = _flatten_cols(df)
-    ren = {}
-    for k in ["League","Season","Team","Date"]:
-        if k in df.columns and k.lower() not in df.columns:
-            ren[k] = k.lower()
-    if ren: df = df.rename(columns=ren)
-    if "date" not in df.columns:
-        date_cand = None
+    df = _flatten_cols(df)
+    # Normalize a 'date' column if present
+    if "date" in (c.lower() for c in df.columns):
+        # leave as-is
+        pass
+    else:
+        # Try to infer a date-like col
         for c in df.columns:
-            lc = str(c).lower()
-            if any(tok in lc for tok in ["date","time","kickoff","utc","start"]):
-                date_cand = c; break
-        if date_cand is not None:
-            try:
-                dt = pd.to_datetime(df[date_cand], errors="coerce", utc=True)
-                df["date"] = dt.dt.tz_convert(None).dt.floor("D")
-            except Exception:
-                pass
+            lc = c.lower()
+            if any(tok in lc for tok in ("date", "time", "kickoff", "utc", "start", "datetime")):
+                try:
+                    dt = pd.to_datetime(df[c], errors="coerce", utc=True)
+                    df["date"] = dt.dt.tz_convert(None)
+                except Exception:
+                    pass
+                break
     return df
 
-# COLUMN MATCHING - More robust than before
-COLUMN_ALIASES = {
-    'corners': ['corner', 'corners', 'ck', 'corner kicks'],
-    'crosses': ['cross', 'crosses', 'crs'],
-    'att_third_touches': ['touches att 3rd', 'touches attacking 3rd', 'touches final third', 'att 3rd'],
-    'yellow': ['yellow', 'yel', 'yellow cards', 'crdy'],
-    'red': ['red', 'red cards', 'crdr'],
-    'fouls': ['fouls', 'foul', 'fouls committed', 'fls'],
-    'shots': ['shots', 'sh', 'total shots'],
-    'sot': ['sot', 'shots on target', 'on target'],
-    'npxg': ['npxg', 'np:xg', 'non-penalty xg'],
-    'npxga': ['npxga', 'np:xga', 'non-penalty xga'],
-    'ppda': ['ppda', 'passes allowed per defensive action']
-}
-
-def find_column(df: pd.DataFrame, aliases: list) -> str:
-    """Find column matching any alias (case-insensitive)"""
-    cols_lower = {c.lower(): c for c in df.columns}
-    for alias in aliases:
-        for col_lower, col_actual in cols_lower.items():
-            if alias.lower() in col_lower:
-                return col_actual
+def _pick(cols_map: dict[str, str], *alts: str) -> str | None:
+    for a in alts:
+        if a in cols_map:
+            return cols_map[a]
     return None
 
-def recency_weighted_last5(df: pd.DataFrame, team: str, cols):
+def _canonicalize(name: str, candidates: list[str]) -> str:
     """
-    FIXED: Now uses correct weight ordering
-    Most recent match gets highest weight (0.30)
+    Return the best-matching team name from candidates using normalized names and difflib.
     """
-    g = df[df["team"].astype(str).str.contains(team, case=False, na=False)].copy()
-    g = g.sort_values("date").tail(5)
-    if g.empty:
-        return {c: np.nan for c in cols}, 0
-    
-    # ✅ FIXED: Take FIRST n weights (most recent), not LAST
-    w = REC_WEIGHTS[:len(g)]
-    w = w / w.sum()
-    
-    out = {}
-    for c in cols:
-        v = pd.to_numeric(g[c], errors="coerce")
-        out[c] = float(np.nansum(v.to_numpy() * w)) if v.notna().any() else np.nan
-    return out, len(g)
+    key = normalize_name(name)
+    table = {normalize_name(c): c for c in candidates}
+    if key in table:
+        return table[key]
+    # try fuzzy
+    match = difflib.get_close_matches(key, list(table.keys()), n=1, cutoff=0.75)
+    return table[match[0]] if match else name  # fall back to original
 
-def make_corners_training(hub: DataHub):
-    """Extract corners training data with improved column matching"""
-    misc = _norm(hub.fbref.read_team_match_stats(stat_type="misc", opponent_stats=False))
-    ptyp = _norm(hub.fbref.read_team_match_stats(stat_type="passing_types", opponent_stats=False))
-    poss = _norm(hub.fbref.read_team_match_stats(stat_type="possession", opponent_stats=False))
-    
-    df = (misc.merge(ptyp, on=["league","season","team","date"], how="left", suffixes=("","_pt"))
-              .merge(poss, on=["league","season","team","date"], how="left", suffixes=("","_pos")))
-    
-    # Use robust column finder
-    ccol = find_column(df, COLUMN_ALIASES['corners'])
-    if ccol is None: 
-        raise RuntimeError("Could not find 'corners' column in FBref misc stats.")
-    df["corners_for"] = pd.to_numeric(df[ccol], errors="coerce")
-    
-    xcol = find_column(df, COLUMN_ALIASES['crosses'])
-    df["crosses"] = pd.to_numeric(df[xcol], errors="coerce") if xcol else np.nan
-    
-    tcol = find_column(df, COLUMN_ALIASES['att_third_touches'])
-    df["att_third_touches"] = pd.to_numeric(df[tcol], errors="coerce") if tcol else np.nan
-    
-    return df
+# -------------------------
+# Build a match-level DataFrame from FBref schedule
+# -------------------------
 
-def make_cards_training(hub: DataHub):
-    """Extract cards training data"""
-    misc = _norm(hub.fbref.read_team_match_stats(stat_type="misc", opponent_stats=False))
-    
-    # Try FotMob discipline data
+def build_matches_df(hub: DataHub) -> pd.DataFrame:
+    """
+    Returns a DataFrame with columns:
+      date, home, away, home_goals, away_goals
+    using FBref schedule for the configured league/season.
+    """
+    # Try a dedicated schedule reader if available, else fall back to "team_match_stats(schedule)"
     try:
-        disc_raw = hub.fotmob.read_team_match_stats(stat_type="Discipline", opponent_stats=True)
-        disc = _norm(disc_raw)
-        if "team" not in disc.columns:
-            tcol = next((c for c in disc.columns if "team" in str(c).lower() or "squad" in str(c).lower()), None)
-            if tcol: disc = disc.rename(columns={tcol: "team"})
-        
-        merge_keys = ["league","season","team"]
-        if "date" in disc.columns and disc["date"].notna().any():
-            merge_keys.append("date")
-        
-        if "date" not in merge_keys:
-            num_cols = [c for c in disc.columns if c not in ("league","season","team") and pd.api.types.is_numeric_dtype(disc[c])]
-            disc = disc.groupby(["league","season","team"], as_index=False)[num_cols].mean() if num_cols else disc.drop_duplicates(subset=["league","season","team"])
-        
-        df = misc.merge(disc, on=merge_keys, how="left", suffixes=("","_fm"))
-    except:
-        df = misc.copy()
-    
-    # Extract cards using robust column matching
-    ycol = find_column(df, COLUMN_ALIASES['yellow'])
-    rcol = find_column(df, COLUMN_ALIASES['red'])
-    
-    if ycol is None and rcol is None:
-        raise RuntimeError("Could not find yellow/red card columns")
-    
-    df["yellow_work"] = pd.to_numeric(df[ycol], errors="coerce") if ycol else 0.0
-    df["red_work"] = pd.to_numeric(df[rcol], errors="coerce") if rcol else 0.0
-    df["cards_total"] = df["yellow_work"].fillna(0) + 2*df["red_work"].fillna(0)
-    
-    fcol = find_column(df, COLUMN_ALIASES['fouls'])
-    df["fouls_committed"] = pd.to_numeric(df[fcol], errors="coerce") if fcol else np.nan
-    
-    # Duels - try FotMob first, fall back to FBref proxies
-    cols_lower = {c.lower(): c for c in df.columns}
-    dwin = next((cols_lower[c] for c in cols_lower if "duel" in c and "won" in c), None)
-    dlos = next((cols_lower[c] for c in cols_lower if "duel" in c and "lost" in c), None)
-    
-    if dwin and dlos:
-        df["duels_total"] = pd.to_numeric(df[dwin], errors="coerce").fillna(0) + pd.to_numeric(df[dlos], errors="coerce").fillna(0)
+        fb = hub.fbref.read_schedule()
+    except Exception:
+        fb = hub.fbref.read_team_match_stats(stat_type="schedule", opponent_stats=False)
+
+    fb = _norm(pd.DataFrame(fb))
+    # Lower-case lookups
+    cmap = {c.lower(): c for c in fb.columns}
+
+    # Two possible formats from soccerdata:
+    # 1) One row per match with home_team, away_team, score_home, score_away, date
+    # 2) Team logs with 'team', 'opponent', 'home/away' or 'venue', goals for/against, date
+    home_c = _pick(cmap, "home_team", "home")
+    away_c = _pick(cmap, "away_team", "away")
+    sh_c   = _pick(cmap, "score_home", "home_goals", "gf", "goals_for", "goals for", "scored")
+    sa_c   = _pick(cmap, "score_away", "away_goals", "ga", "goals_against", "goals against", "conceded")
+    date_c = _pick(cmap, "date", "datetime", "kickoff")
+
+    if home_c and away_c and sh_c and sa_c:
+        df = fb[[home_c, away_c, sh_c, sa_c] + ([date_c] if date_c else [])].copy()
+        df = df.rename(columns={
+            home_c: "home",
+            away_c: "away",
+            sh_c: "home_goals",
+            sa_c: "away_goals",
+        })
     else:
-        # FBref proxy: aerials
-        aw = next((cols_lower[c] for c in cols_lower if "aerial" in c and "won" in c), None)
-        al = next((cols_lower[c] for c in cols_lower if "aerial" in c and "lost" in c), None)
-        proxy = None
-        if aw and al:
-            proxy = pd.to_numeric(df[aw], errors="coerce").fillna(0) + pd.to_numeric(df[al], errors="coerce").fillna(0)
-        df["duels_total"] = proxy if proxy is not None else np.nan
-    
+        # Team logs -> keep only home rows to reconstruct match list
+        team_c  = _pick(cmap, "team", "squad")
+        opp_c   = _pick(cmap, "opponent", "opp")
+        venue_c = _pick(cmap, "home/away", "homeaway", "home_away", "venue")
+        gf_c    = _pick(cmap, "gf", "goals_for", "goals for", "scored")
+        ga_c    = _pick(cmap, "ga", "goals_against", "goals against", "conceded")
+        if not all([team_c, opp_c, venue_c, gf_c, ga_c]):
+            raise RuntimeError("Could not map FBref schedule columns.")
+        temp = fb[[team_c, opp_c, venue_c, gf_c, ga_c] + ([date_c] if date_c else [])].copy()
+        temp["_is_home"] = temp[venue_c].astype(str).str.lower().str.startswith("home")
+        temp = temp[temp["_is_home"]]
+        df = temp.rename(columns={
+            team_c: "home",
+            opp_c: "away",
+            gf_c: "home_goals",
+            ga_c: "away_goals",
+        })
+
+    # Parse and clean types
+    for g in ("home_goals", "away_goals"):
+        df[g] = pd.to_numeric(df[g], errors="coerce").astype("Int64")
+    if "date" not in df.columns and date_c:
+        df["date"] = pd.to_datetime(fb[date_c], errors="coerce")
+    elif "date" in df.columns:
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df["date"] = df["date"].dt.tz_localize(None)
+    df = df.dropna(subset=["home", "away", "home_goals", "away_goals"]).copy()
     return df
 
-def fit_dc_from_fbref(hub: DataHub, time_weighted: bool = True):
+# -------------------------
+# Optional: augment with corners/cards from Football-Data
+# -------------------------
+
+def augment_with_footballdata(df_matches: pd.DataFrame, league: str, season: int) -> pd.DataFrame:
     """
-    Fit Dixon-Coles with optional time weighting
-    ✅ NEW: Time-weighted fitting with exponential decay
+    Adds columns when available:
+      home_corners, away_corners, home_cards, away_cards
+    using Football-Data (HC, AC, HY, AY, HR, AR).
+    Best-effort join on (date, normalized home/away).
     """
-    fb = _norm(hub.fbref.read_team_match_stats(stat_type="schedule"))
-    cols = {c.lower(): c for c in fb.columns}
-    
-    def pick(*alts):
-        for a in alts:
-            if a in cols: return cols[a]
-        return None
-    
-    team_c  = pick("team")
-    opp_c   = pick("opponent", "opp")
-    venue_c = pick("venue", "home/away", "homeaway", "home_away")
-    gf_c    = pick("gf", "goals_for", "goals for", "goals", "scored")
-    ga_c    = pick("ga", "goals_against", "goals against", "conceded")
-    date_c  = pick("date", "datetime")
-    
-    if not all([team_c, opp_c, venue_c, gf_c, ga_c]): 
-        return None
-    
-    fb["_gf"] = pd.to_numeric(fb[gf_c], errors="coerce")
-    fb["_ga"] = pd.to_numeric(fb[ga_c], errors="coerce")
-    fb["_venue"] = fb[venue_c].astype(str).str.lower()
-    
-    if date_c and time_weighted:
-        fb["_date"] = pd.to_datetime(fb[date_c], errors="coerce")
-        today = pd.Timestamp.now()
-        # Exponential decay: half-life ~180 days
-        xi = 0.00385  # ln(2)/180
-        fb["_weight"] = fb["_date"].apply(lambda d: np.exp(-xi * (today - d).days) if pd.notna(d) else 1.0)
-    else:
-        fb["_weight"] = 1.0
-    
-    use = fb["_gf"].notna() & fb["_ga"].notna() & fb["_venue"].str.startswith("home")
-    df = fb.loc[use, [team_c, opp_c, "_gf", "_ga", "_weight"]].rename(
-        columns={team_c:"home_team", opp_c:"away_team", "_gf":"home_goals", "_ga":"away_goals", "_weight":"weight"})
-    
-    if len(df) < 200: 
-        return None
-    
-    teams = sorted(set(df["home_team"]).union(df["away_team"]))
-    df["home_goals"] = df["home_goals"].astype(int)
-    df["away_goals"] = df["away_goals"].astype(int)
-    
-    return fit_dixon_coles(df, teams, DCConfig(), weights=df["weight"].values if time_weighted else None)
+    try:
+        import soccerdata as sd
+        fd = sd.FootballData(leagues=[league], seasons=[season])
+        df_fd = fd.read_results()
+    except Exception:
+        return df_matches  # silently skip if missing
 
-def poisson_tail_over(line_half: float, lam: float) -> float:
-    """Over k.5 => sum_{n=k+1..inf} Poisson(n; lam)"""
-    from math import exp, factorial
-    k = int(line_half - 0.5)
-    cdf = sum(exp(-lam)*lam**i/factorial(i) for i in range(0, k+1))
-    return max(0.0, min(1.0, 1.0 - cdf))
+    df_fd = _norm(pd.DataFrame(df_fd))
+    cmap = {c.lower(): c for c in df_fd.columns}
 
-def shrink_to_league(lam: float, mu: float, n_eff: int, k: int = 20) -> float:
-    """Empirical Bayes shrinkage toward league mean"""
-    w = n_eff / (n_eff + k)
-    return w*lam + (1-w)*mu
+    home_c = _pick(cmap, "home_team", "hometeam", "home")
+    away_c = _pick(cmap, "away_team", "awayteam", "away")
+    date_c = _pick(cmap, "date", "datetime")
+    hc_c   = _pick(cmap, "hc")
+    ac_c   = _pick(cmap, "ac")
+    hy_c   = _pick(cmap, "hy")
+    ay_c   = _pick(cmap, "ay")
+    hr_c   = _pick(cmap, "hr")
+    ar_c   = _pick(cmap, "ar")
 
-def source_status_text(ok: dict, err: dict) -> str:
-    parts = []
-    for name in ["FBref","Understat","ESPN","FotMob","SofaScore","ClubElo","MatchHistory"]:
-        if name in ok:
-            parts.append(f"{name}: OK")
-        elif name in err:
-            parts.append(f"{name}: FAIL ({err[name]})")
-    return "; ".join(parts)
+    if not (home_c and away_c and date_c):
+        return df_matches
+
+    # Normalize join keys
+    def _keyframe(df, home_col, away_col, date_col):
+        out = df.copy()
+        out["_home_key"] = out[home_col].astype(str).map(normalize_name)
+        out["_away_key"] = out[away_col].astype(str).map(normalize_name)
+        out["_date_key"] = pd.to_datetime(out[date_col], errors="coerce").dt.tz_localize(None).dt.floor("D")
+        return out
+
+    left  = _keyframe(df_matches, "home", "away", "date")
+    right = _keyframe(df_fd, home_c, away_c, date_c)
+
+    merged = left.merge(
+        right[["_home_key", "_away_key", "_date_key"] + [x for x in [hc_c, ac_c, hy_c, ay_c, hr_c, ar_c] if x]],
+        on=["_home_key", "_away_key", "_date_key"],
+        how="left",
+        suffixes=("", "_fd"),
+    )
+
+    # Map corners
+    if hc_c and ac_c:
+        merged["home_corners"] = pd.to_numeric(merged[hc_c], errors="coerce")
+        merged["away_corners"] = pd.to_numeric(merged[ac_c], errors="coerce")
+    # Map cards (simple sum of yellows + reds)
+    if hy_c and ay_c:
+        merged["home_cards"] = pd.to_numeric(merged[hy_c], errors="coerce").fillna(0)
+        merged["away_cards"] = pd.to_numeric(merged[ay_c], errors="coerce").fillna(0)
+        if hr_c:
+            merged["home_cards"] = merged["home_cards"] + pd.to_numeric(merged[hr_c], errors="coerce").fillna(0)
+        if ar_c:
+            merged["away_cards"] = merged["away_cards"] + pd.to_numeric(merged[ar_c], errors="coerce").fillna(0)
+
+    # Clean and drop join keys
+    keep = ["date", "home", "away", "home_goals", "away_goals", "home_corners", "away_corners", "home_cards", "away_cards"]
+    for k in keep:
+        if k not in merged.columns:
+            merged[k] = merged.get(k)
+    result = merged[keep].copy()
+    return result
+
+# -------------------------
+# Rendering (extended)
+# -------------------------
+
+def render_extended(report: dict, last_n: int) -> str:
+    f = report["fixture"]
+    g = report["goals"]
+    mk = report["markets"]
+
+    lines: list[str] = []
+    lines.append(f"# {f['home']} vs {f['away']}")
+    lines.append("")
+    lines.append(f"**Goals λ** — home: {g['lambda_home']:.2f}, away: {g['lambda_away']:.2f}, rho: {g['rho']:.2f}")
+    lines.append("")
+    lines.append("## Model probabilities")
+    for k in ("home", "draw", "away", "btts", "over_1.5", "under_1.5", "over_2.5", "under_2.5", "over_3.5", "under_3.5"):
+        if k in mk:
+            label = k.replace("_", " ").upper()
+            lines.append(f"- **{label}**: {mk[k]:.3f}")
+
+    # Props (corners/cards) if available
+    props = report.get("props", {})
+    if "corners" in props:
+        lines.append("")
+        lines.append("## Corners (Poisson totals)")
+        lines.append(f"- λ_total ≈ {props.get('corners_lambda', float('nan')):.2f}")
+        for k, v in props["corners"].items():
+            lines.append(f"  - **{k.replace('_',' ').title()}**: {v:.3f}")
+    if "cards" in props:
+        lines.append("")
+        lines.append("## Cards (Poisson totals)")
+        lines.append(f"- λ_total ≈ {props.get('cards_lambda', float('nan')):.2f}")
+        for k, v in props["cards"].items():
+            lines.append(f"  - **{k.replace('_',' ').title()}**: {v:.3f}")
+
+    # Trends
+    tr = report.get("trends", {"samples": last_n})
+    lines.append("")
+    lines.append(f"## Trends (last {tr.get('samples', last_n)} matches)")
+    if "goals" in tr:
+        lines.append("- **Goals**:")
+        for k, v in tr["goals"].items():
+            lines.append(f"  - {k.replace('_',' ').title()}: {v:.0%}")
+    if "corners" in tr:
+        lines.append("- **Corners**:")
+        for k, v in tr["corners"].items():
+            lines.append(f"  - {k.replace('_',' ').title()}: {v:.0%}")
+    if "cards" in tr:
+        lines.append("- **Cards**:")
+        for k, v in tr["cards"].items():
+            lines.append(f"  - {k.replace('_',' ').title()}: {v:.0%}")
+    if "team_corners" in tr:
+        lines.append("- **Team corners**:")
+        for team, block in tr["team_corners"].items():
+            s = ", ".join([f"{kk}={vv:.0%}" for kk, vv in block.items()])
+            lines.append(f"  - {team}: {s}")
+
+    return "\n".join(lines)
+
+# -------------------------
+# Main
+# -------------------------
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--league", required=True)
-    ap.add_argument("--season", required=True)
-    ap.add_argument("--fixtures", required=True)
-    ap.add_argument("--timezone", default="Australia/Sydney")
+    ap.add_argument("--season", required=True, type=int)
+    ap.add_argument("--fixtures", required=True, help='Semicolon-separated: "Home vs Away|YYYY-MM-DD HH:MM:SS; ..."')
+    ap.add_argument("--timezone", default="Australia/Sydney")  # kept for compatibility (not used by model)
     ap.add_argument("--out", default="out/preview_plus.md")
-    ap.add_argument("--odds_json", default=None)
-    ap.add_argument("--stdout", action="store_true")
-    ap.add_argument("--with_tables", action="store_true", help="Append diagnostics data tables")
-    ap.add_argument("--time_weighted_dc", action="store_true", help="Use time-weighted Dixon-Coles fitting")
+    ap.add_argument("--last-n", type=int, default=10, help="Trend window size")
     args = ap.parse_args()
 
-    # ✅ NEW: Apply vig removal to odds
-    odds_book = load_odds_from_json(args.odds_json, apply_vig_removal=True) if args.odds_json else None
+    # Build hub
+    hub = DataHub(SourceConfig(leagues=[args.league], seasons=[args.season]),
+                  enable_whoscored=False, enable_sofascore=False)
 
-    # Build hub + detect source status
-    ok, err = {}, {}
-    try:
-        hub = DataHub(SourceConfig(leagues=[args.league], seasons=[args.season]), 
-                      enable_whoscored=False, enable_sofascore=True)
-        ok["FBref"]=True; ok["Understat"]=True; ok["ESPN"]=True; 
-        ok["FotMob"]=True; ok["MatchHistory"]=True; ok["SofaScore"]=True; ok["ClubElo"]=True
-    except Exception as e:
-        raise
+    # Build matches from FBref schedule, then augment with corners/cards if we can
+    matches_df = build_matches_df(hub)
+    matches_df = augment_with_footballdata(matches_df, args.league, args.season)
 
-    # ✅ NEW: Initialize advanced features engine
-    advanced = AdvancedFeatureEngine(hub)
-    opponent_adj = OpponentAdjuster(hub)
-
-    # Goals model with time weighting
-    params = None
-    try:
-        params = fit_dc_from_fbref(hub, time_weighted=args.time_weighted_dc)
-        ok["FBref"]=True
-    except Exception as e:
-        err["FBref"]=str(e)
-
-    # Training frames
-    corners_df = make_corners_training(hub)
-    cards_df = make_cards_training(hub)
-
-    # League means
-    mu_team_corners = pd.to_numeric(corners_df["corners_for"], errors="coerce").mean(skipna=True)
-    mu_team_cards   = pd.to_numeric(cards_df["cards_total"], errors="coerce").mean(skipna=True)
-
-    # Fit GLMs
-    c_spec = PoissonSpec(target_col="corners_for", feature_cols=("crosses","att_third_touches"))
-    corners_glm = None
-    try:
-        corners_train = corners_df.dropna(subset=list(c_spec.feature_cols)+[c_spec.target_col])
-        if len(corners_train) > 50:
-            corners_glm = fit_poisson_glm(corners_train, c_spec)
-    except Exception as e:
-        err["CornersGLM"]=str(e)
-
-    k_spec = PoissonSpec(target_col="cards_total", feature_cols=("fouls_committed","duels_total"))
-    cards_glm = None
-    try:
-        cards_train = cards_df.dropna(subset=list(k_spec.feature_cols)+[k_spec.target_col])
-        if len(cards_train) > 50:
-            cards_glm = fit_poisson_glm(cards_train, k_spec)
-    except Exception as e:
-        err["CardsGLM"]=str(e)
-
-    blocks = []
-    for part in args.fixtures.split(";"):
-        fx = parse_fixture(part.strip())
-        home, away = fx["home"], fx["away"]
-
-        # ✅ NEW: Get opponent-adjusted strength ratings
-        home_strength = opponent_adj.get_team_strength(home)
-        away_strength = opponent_adj.get_team_strength(away)
-
-        # ✅ NEW: Get NP-xG data from Understat
-        home_npxg_data = advanced.get_npxg_adjusted(home, away, last_n=5)
-        away_npxg_data = advanced.get_npxg_adjusted(away, home, last_n=5)
-
-        # Scoreline pmf (goals) - adjusted by opponent strength
-        if params is not None and f"a_{home}" in params and f"d_{away}" in params:
-            pmf = scoreline_pmf(home, away, params, DCConfig())
-        else:
-            # Fallback with opponent adjustment
-            lam_h = 1.35 * (home_strength / away_strength)
-            lam_a = 1.10 * (away_strength / home_strength)
-            pmf = {}
-            tot = 0.0
-            from math import exp, factorial
-            for h in range(0,8):
-                for a in range(0,8):
-                    ph = exp(-lam_h)*lam_h**h/factorial(h)
-                    pa = exp(-lam_a)*lam_a**a/factorial(a)
-                    p = ph*pa
-                    pmf[(h,a)] = p
-                    tot += p
-            for k in pmf: pmf[k] /= tot
-
-        p_home = sum(p for (h,a),p in pmf.items() if h>a)
-        p_draw = sum(p for (h,a),p in pmf.items() if h==a)
-        p_away = sum(p for (h,a),p in pmf.items() if h<a)
-        p_over15 = sum(p for (h,a),p in pmf.items() if h+a>=2)
-        p_over25 = sum(p for (h,a),p in pmf.items() if h+a>2.5)
-        p_btts = sum(p for (h,a),p in pmf.items() if h>0 and a>0)
-
-        # Recency-weighted team features
-        c_feats_h, n_h = recency_weighted_last5(corners_df, home, ["crosses","att_third_touches"])
-        c_feats_a, n_a = recency_weighted_last5(corners_df, away, ["crosses","att_third_touches"])
-        k_feats_h, nk_h = recency_weighted_last5(cards_df, home, ["fouls_committed","duels_total"])
-        k_feats_a, nk_a = recency_weighted_last5(cards_df, away, ["fouls_committed","duels_total"])
-
-        # Corners λ with league shrinkage
-        p_corners_over = None
-        lam_ch=lam_ca=lam_c_match=lam_c_match_adj=None
-        if corners_glm is not None:
-            lam_ch = predict_rate(corners_glm, pd.Series(c_feats_h).fillna(0))
-            lam_ca = predict_rate(corners_glm, pd.Series(c_feats_a).fillna(0))
-            lam_ch = shrink_to_league(lam_ch, mu_team_corners, n_h)
-            lam_ca = shrink_to_league(lam_ca, mu_team_corners, n_a)
-            lam_c_match = lam_ch + lam_ca
-            p_corners_over = poisson_tail_over(9.5, lam_c_match)
-            lam_c_match_adj = lam_c_match
-
-        # Cards λ with league shrinkage
-        p_cards_over = None
-        lam_kh=lam_ka=lam_k_match=None
-        if cards_glm is not None:
-            lam_kh = predict_rate(cards_glm, pd.Series(k_feats_h).fillna(0))
-            lam_ka = predict_rate(cards_glm, pd.Series(k_feats_a).fillna(0))
-            lam_kh = shrink_to_league(lam_kh, mu_team_cards, nk_h)
-            lam_ka = shrink_to_league(lam_ka, mu_team_cards, nk_a)
-            lam_k_match = lam_kh + lam_ka
-            p_cards_over = poisson_tail_over(3.5, lam_k_match)
-
-        # ✅ NEW: PPDA metrics
-        home_ppda = advanced.get_ppda(home)
-        away_ppda = advanced.get_ppda(away)
-
-        # Injuries
-        try:
-            inj = hub.sofascore.read_missing_players() if hub.sofascore else None
-            inj_count = len(inj) if inj is not None else 0
-        except Exception:
-            inj_count = 0
-
-        # Picks (with optional pricing)
-        def mkpick(name, sel, p, safest=False, why="Model-based edge"):
-            pick = {
-                "market": name, "selection": sel, "my_prob": p,
-                "fair_odds": fair_odds(p), 
-                "fair_odds_american": american_from_decimal(fair_odds(p)),
-                "min_acceptable": min_acceptable_odds(p, 0.03, safest),
-                "confidence": 2, "why": why
-            }
-            
-            if odds_book and name in odds_book:
-                snap = odds_book[name]
-                prices = snap.prices
-                key = sel.lower().strip()
-                
-                if name == "1X2":
-                    if key not in prices:
-                        key = "home" if sel==home else ("away" if sel==away else key)
-                elif "over" in key: key = "over"
-                elif "under" in key: key = "under"
-                elif name == "BTTS": key = "yes" if "yes" in key else ("no" if "no" in key else key)
-                
-                if key in prices:
-                    o = float(prices[key])
-                    pick["price_dec"]=o
-                    pick["price_american"]=am_from_dec(o)
-                    pick["price_ts"]=snap.timestamp
-                    pick["ev_pct"]=ev_percent(p,o)
-                    pick["kelly_units"]=round(0.33*kelly_fraction(p,o),4)
-            
-            return pick
-
-        picks = {"Safest": [], "Safe": [], "Medium": [], "Longshot/Plus‑Money": []}
-        
-        # Build picks with enhanced reasoning
-        picks["Safest"].append(mkpick(
-            "1X2", f"{home}", p_home, True,
-            f"Home win prob {p_home:.1%}. Strength: {home_strength:.0f} vs {away_strength:.0f}. NP-xG: {home_npxg_data.get('npxg', 0):.2f}"
-        ))
-        picks["Safest"].append(mkpick(
-            "Totals O/U 2.5", "Over", p_over25, True,
-            f"Combined attack strength suggests {p_over25:.1%} chance of 3+ goals"
-        ))
-        picks["Safe"].append(mkpick("BTTS", "Yes", p_btts, False))
-        picks["Safe"].append(mkpick("Over 1.5 Goals", "Over", p_over15, False))
-        
-        if p_away < 0.40: 
-            picks["Longshot/Plus‑Money"].append(mkpick("1X2", f"{away}", p_away, False))
-        if p_corners_over is not None: 
-            picks["Safe"].append(mkpick("Match Corners O/U 9.5", "Over", p_corners_over, False))
-        if p_cards_over is not None: 
-            picks["Safe"].append(mkpick("Match Cards O/U 3.5", "Over", p_cards_over, False))
-
-        # Player props (enhanced)
-        props_tables = []
-        try:
-            shoot = _norm(hub.fbref.read_player_match_stats(stat_type="shooting"))
-            
-            def top_players(team):
-                g = shoot[shoot["team"].astype(str).str.contains(team, case=False, na=False)].sort_values("date").tail(200)
-                sc = find_column(g, COLUMN_ALIASES['shots']) or "shots"
-                st = find_column(g, COLUMN_ALIASES['sot']) or sc
-                
-                g["shots"] = pd.to_numeric(g.get(sc, np.nan), errors="coerce")
-                g["sot"] = pd.to_numeric(g.get(st, np.nan), errors="coerce")
-                
-                mcol = next((c for c in g.columns if "min" in c.lower()), None)
-                if mcol:
-                    g["min"] = pd.to_numeric(g[mcol], errors="coerce")
-                else:
-                    g["min"] = 90.0
-                
-                last5 = g.groupby("player", as_index=False).tail(5)
-                agg = last5.groupby("player", as_index=False).agg(
-                    shots=("shots","mean"), 
-                    sot=("sot","mean"), 
-                    min90=("min","mean")
-                )
-                
-                agg["exp_min"] = 75.0
-                agg["lam_shots"] = agg["shots"] * (agg["exp_min"]/90.0)
-                agg["lam_sot"] = agg["sot"] * (agg["exp_min"]/90.0)
-                
-                from math import exp
-                agg["P(Shots>=1)"] = 1 - np.exp(-agg["lam_shots"])
-                agg["P(Shots>=2)"] = 1 - np.exp(-agg["lam_shots"]) - agg["lam_shots"]*np.exp(-agg["lam_shots"])
-                agg["P(SOT>=1)"] = 1 - np.exp(-agg["lam_sot"])
-                agg = agg.sort_values("P(Shots>=1)", ascending=False).head(2)
-                
-                return agg[["player","shots","sot","exp_min","P(Shots>=1)","P(Shots>=2)","P(SOT>=1)"]]
-            
-            home_tp = top_players(home)
-            away_tp = top_players(away)
-            props_tables.append(("Player props — Top shot candidates (Home)", home_tp))
-            props_tables.append(("Player props — Top shot candidates (Away)", away_tp))
-        except Exception as e:
-            err["PlayerProps"] = str(e)
-
-        # Build tables
-        tables = []
-        if args.with_tables:
-            tables.append(("Source status", [{"source_status": source_status_text(ok, err)}]))
-            
-            # ✅ NEW: Team strength comparison
-            tables.append(("Team Strength (ClubElo)", [{
-                "team": home,
-                "rating": home_strength,
-                "team_away": away,
-                "rating_away": away_strength,
-                "advantage": home_strength - away_strength
-            }]))
-            
-            # ✅ NEW: NP-xG data
-            tables.append(("Non-Penalty xG (Last 5, Opponent-Adjusted)", [{
-                "team": home,
-                "npxg": home_npxg_data.get('npxg', np.nan),
-                "npxga": home_npxg_data.get('npxga', np.nan),
-                "team_away": away,
-                "npxg_away": away_npxg_data.get('npxg', np.nan),
-                "npxga_away": away_npxg_data.get('npxga', np.nan)
-            }]))
-            
-            # ✅ NEW: PPDA (Pressing)
-            tables.append(("Pressing Metrics (PPDA)", [{
-                "team": home,
-                "ppda": home_ppda,
-                "team_away": away,
-                "ppda_away": away_ppda,
-                "note": "Lower PPDA = more intense press"
-            }]))
-            
-            if corners_glm is not None:
-                tables.append(("Corners diagnostics", [{
-                    "home_crosses_L5": c_feats_h.get("crosses", np.nan),
-                    "home_att3rd_L5": c_feats_h.get("att_third_touches", np.nan),
-                    "away_crosses_L5": c_feats_a.get("crosses", np.nan),
-                    "away_att3rd_L5": c_feats_a.get("att_third_touches", np.nan),
-                    "lambda_home": lam_ch, "lambda_away": lam_ca,
-                    "lambda_match": lam_c_match_adj, "league_team_mean": mu_team_corners,
-                    "P(Over 9.5)": p_corners_over
-                }]))
-            
-            if cards_glm is not None:
-                tables.append(("Cards diagnostics", [{
-                    "home_fouls_L5": k_feats_h.get("fouls_committed", np.nan),
-                    "home_duels_L5": k_feats_h.get("duels_total", np.nan),
-                    "away_fouls_L5": k_feats_a.get("fouls_committed", np.nan),
-                    "away_duels_L5": k_feats_a.get("duels_total", np.nan),
-                    "lambda_home": lam_kh, "lambda_away": lam_ka,
-                    "lambda_match": lam_k_match, "league_team_mean": mu_team_cards,
-                    "P(Over 3.5)": p_cards_over
-                }]))
-            
-            home_form = {"team": home, **c_feats_h, **k_feats_h}
-            away_form = {"team": away, **c_feats_a, **k_feats_a}
-            tables.append(("Team last-5 features (recency-weighted)", [home_form, away_form]))
-            
-            for t in props_tables:
-                tables.append(t)
-
-        meta = {
-            "home": home, "away": away, "kickoff_aest": fx["kickoff"],
-            "market_snapshot": "Odds have been vig-adjusted using proportional method." if odds_book else "Probability-first (no odds provided).",
-            "key_news": (f"SofaScore injuries: {inj_count} entries" if inj_count>0 else "Injuries feed unavailable"),
-            "edges": f"- Goals: DC model {'(time-weighted)' if args.time_weighted_dc else ''}; NP-xG opponent-adjusted\n- Corners: crosses + attacking touches (league-shrunk)\n- Cards: fouls + duels (league-shrunk)\n- Pressing: PPDA metrics included",
-            "tactics": f"- {home} strength: {home_strength:.0f} | {away} strength: {away_strength:.0f}\n- {home} PPDA: {home_ppda:.2f} | {away} PPDA: {away_ppda:.2f}\n- Wide vs compact, press & discipline included",
-            "source_status": source_status_text(ok, err)
-        }
-        
-        report = render_game_report(meta, picks, tables)
-        blocks.append(report)
-
+    # Prepare output
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    final = "\n\n---\n\n".join(blocks)
-    out_path.write_text(final, encoding="utf-8")
-    print(f"✅ Wrote enhanced preview to: {out_path}")
-    
-    if args.stdout:
-        print("\n" + final + "\n")
+    blocks: list[str] = []
+
+    # Candidate names (to canonicalize 'Liverpool' vs 'Liverpool FC', etc.)
+    candidates = sorted(set(matches_df["home"]).union(matches_df["away"]))
+
+    for part in args.fixtures.split(";"):
+        fx = parse_fixture(part.strip())
+        home = _canonicalize(fx["home"], candidates)
+        away = _canonicalize(fx["away"], candidates)
+
+        # Build the full report (fits DC v2 internally; uses recency weighting)
+        rep_cfg = ReportConfig(
+            last_n_trend=args.last_n,
+            goal_lines=(1.5, 2.5, 3.5),
+            corner_lines=(7.5, 8.5, 9.5),
+            card_lines=(3.5, 4.5),
+        )
+        report = build_fixture_report(matches_df, home, away, rep_cfg)
+
+        # Render extended markdown (no PPDA / no legacy "Picks by Tier")
+        md = render_extended(report, args.last_n)
+        blocks.append(md)
+
+    final_md = "\n\n---\n\n".join(blocks)
+    out_path.write_text(final_md, encoding="utf-8")
+    print(f"✅ Wrote extended preview to: {out_path}")
+
+    # Also print to stdout for quick view
+    try:
+        print("\n" + final_md + "\n")
+    except Exception:
+        pass
 
 if __name__ == "__main__":
     main()
